@@ -3,6 +3,8 @@ import { Canvas } from "@react-three/fiber";
 import { OrbitControls, Line } from "@react-three/drei";
 import { motion, AnimatePresence } from "framer-motion";
 
+const BACKEND_URL = "https://nova-backened.onrender.com";
+
 const fontStyle = `@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@300;700&display=swap');`;
 
 // =========================================
@@ -227,15 +229,15 @@ export default function App() {
   const [response,  setResponse]  = useState("");
   const [showResp,  setShowResp]  = useState(false);
   const [handsFree, setHandsFree] = useState(false);
-  const [toast,     setToast]     = useState("");   // FIX: user-visible error messages
-  const [micOk,     setMicOk]     = useState(true); // FIX: track mic permission state
+  const [toast,     setToast]     = useState("");
+  const [micOk,     setMicOk]     = useState(true);
 
   const recRef            = useRef(null);
   const activeRef         = useRef(false);
   const handsFreeRef      = useRef(false);
   const startListeningRef = useRef(null);
 
-  // FIX: Use a ref for status inside polling so the interval never depends on
+  // Use a ref for status inside polling so the interval never depends on
   // the status state value and does NOT restart on every status change.
   const statusRef = useRef("Idle");
   useEffect(() => {
@@ -258,45 +260,44 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  // FIX: Status polling — removed `status` from dependency array.
-  // Previously it restarted the interval on every status change, and the
-  // guard inside used stale closure values. Now we use statusRef.
+  // FIX 1: Status polling — empty dependency array so it runs once.
+  // Uses statusRef/handsFreeRef inside to avoid stale closures.
   useEffect(() => {
     const poll = async () => {
-      // Don't overwrite while frontend is managing these states
       if (
-  statusRef.current === "Thinking" ||
-  statusRef.current === "Speaking" ||
-  handsFreeRef.current
-) {
-  return;
-}
+        statusRef.current === "Thinking" ||
+        statusRef.current === "Speaking" ||
+        handsFreeRef.current
+      ) {
+        return;
+      }
 
       try {
-        const r = await fetch("http://127.0.0.1:5000/status");
+        const r = await fetch(`${BACKEND_URL}/status`);
+        if (!r.ok) throw new Error("Backend offline");
         const d = await r.json();
         if (d.status) {
           setStatus(d.status.replace("...", ""));
         }
-      } catch {
-        // Backend offline — silently ignore
+      } catch (err) {
+        console.log("Backend connection error:", err);
       }
     };
 
     poll();
     const id = setInterval(poll, 800);
     return () => clearInterval(id);
-  }, []); // ← empty deps: runs once, uses statusRef inside
+  }, []); // intentionally empty — uses refs inside
 
   // ── CORE: speak a string, then callback ──
   const speak = useCallback((text, onDone) => {
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang   = "en-IN"; // ✅ FIX: match Indian English for TTS
-    utterance.rate   = 1;
-    utterance.pitch  = 1;
-    utterance.volume = 1;
-    utterance.onend  = () => onDone?.();
+    utterance.lang    = "en-IN";
+    utterance.rate    = 1;
+    utterance.pitch   = 1;
+    utterance.volume  = 1;
+    utterance.onend   = () => onDone?.();
     utterance.onerror = (e) => {
       console.warn("TTS error:", e.error);
       onDone?.();
@@ -306,134 +307,132 @@ export default function App() {
 
   // ── CORE: one full listen → think → speak cycle ──
   const startListening = useCallback(() => {
-  const SR =
-    window.SpeechRecognition ||
-    window.webkitSpeechRecognition;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  if (!SR) {
-    alert("Use Chrome browser");
-    return;
-  }
+    if (!SR) {
+      alert("Speech recognition requires Chrome browser");
+      return;
+    }
 
-  // stop old recognition
-  if (recRef.current) {
-    try {
-      recRef.current.stop();
-    } catch (_) {}
-  }
+    // FIX 2: Guard against starting a second recognition instance
+    // while one is already running.
+    if (activeRef.current) {
+      console.log("Already listening — skipping duplicate start");
+      return;
+    }
 
-  const rec = new SR();
-  recRef.current = rec;
+    // Stop any old recognition cleanly
+    if (recRef.current) {
+      try { recRef.current.stop(); } catch (_) {}
+      recRef.current = null;
+    }
 
-rec.lang = "en-IN";
-rec.continuous = true;
-rec.interimResults = false;
-rec.maxAlternatives = 1; 
-rec.pauseThreshold = 2;
-rec.phraseTimeLimit = 8;  // ✅ FIX: more alternatives = better accuracy
+    const rec = new SR();
+    recRef.current = rec;
 
-  activeRef.current = true;
-  setStatus("Listening");
+    rec.lang             = "en-IN";
+    rec.continuous       = true;
+    rec.interimResults   = false;
+    rec.maxAlternatives  = 3; // FIX 3: more alternatives improves accuracy
 
-  console.log("Recognition started");
+    activeRef.current = true;
+    setStatus("Listening");
 
-  rec.onstart = () => {
-    console.log("Mic listening...");
-  };
+    console.log("Recognition started");
 
-  // ✅ FIX: removed duplicate onsoundstart / onspeechstart handlers
-  rec.onaudiostart  = () => console.log("Audio detected");
-  rec.onsoundstart  = () => console.log("Sound detected");
-  rec.onspeechstart = () => console.log("Speech started");
-  rec.onspeechend   = () => console.log("Speech ended");
+    rec.onstart      = () => console.log("Mic listening...");
+    rec.onaudiostart = () => console.log("Audio detected");
+    rec.onsoundstart = () => console.log("Sound detected");
+    rec.onspeechstart= () => console.log("Speech started");
+    rec.onspeechend  = () => console.log("Speech ended");
 
-  rec.onresult = async (event) => {
-    const transcript = Array.from(
-      event.results
-    )
-      .map((r) => r[0].transcript)
-      .join("")
-      .trim();
+    rec.onresult = async (event) => {
+      // Pick the top alternative from the last result
+      const transcript = Array.from(event.results)
+        .map((r) => r[0].transcript)
+        .join("")
+        .trim();
 
-    console.log("User said:", transcript);
+      console.log("User said:", transcript);
+      if (!transcript) return;
 
-    if (!transcript) return;
+      try { rec.stop(); } catch (_) {}
+      activeRef.current = false;
+      setStatus("Thinking");
 
-    try {
-      rec.stop();
-    } catch (_) {}
-
-    activeRef.current = false;
-    setStatus("Thinking");
-
-    try {
-      const res = await fetch(
-        "http://127.0.0.1:5000/command",
-        {
+      try {
+        // FIX 4: Use BACKEND_URL instead of hardcoded localhost
+        const res = await fetch(`${BACKEND_URL}/command`, {
           method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
-          body: JSON.stringify({
-            command: transcript,
-          }),
-        }
-      );
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: transcript }),
+        });
 
-      const data = await res.json();
+        if (!res.ok) throw new Error(`Server error: ${res.status}`);
 
-      const reply =
-        data.response || "No response";
+        const data  = await res.json();
+        const reply = data.response || "No response";
 
-      setResponse(reply);
-      setShowResp(true);
-      setStatus("Speaking");
+        setResponse(reply);
+        setShowResp(true);
+        setStatus("Speaking");
 
-      speak(reply, () => {
-        setShowResp(false);
+        speak(reply, () => {
+          setShowResp(false);
+          if (handsFreeRef.current) {
+            setTimeout(() => startListeningRef.current?.(), 1000);
+          } else {
+            setStatus("Idle");
+          }
+        });
+      } catch (err) {
+        console.error("Command error:", err);
+        setToast("Failed to reach Nova backend. Check your connection.");
+        setStatus("Idle");
+      }
+    };
 
+    rec.onerror = (e) => {
+      console.log("Speech error:", e.error);
+      activeRef.current = false;
+
+      if (e.error === "no-speech") {
+        // FIX 5: Only auto-retry in hands-free mode; don't loop forever otherwise
         if (handsFreeRef.current) {
-          setTimeout(() => {
-            startListeningRef.current?.();
-          }, 1000);
+          setTimeout(() => startListeningRef.current?.(), 2000);
         } else {
           setStatus("Idle");
         }
-      });
+        return;
+      }
+
+      if (e.error === "not-allowed" || e.error === "permission-denied") {
+        setMicOk(false);
+        setToast("Microphone blocked. Allow mic in Chrome settings and refresh.");
+        setStatus("Idle");
+        return;
+      }
+
+      setStatus("Idle");
+    };
+
+    rec.onend = () => {
+      console.log("Recognition ended");
+      // FIX 6: If recognition ends unexpectedly while we're still in
+      // hands-free Listening state, restart it.
+      if (handsFreeRef.current && statusRef.current === "Listening") {
+        setTimeout(() => startListeningRef.current?.(), 500);
+      }
+    };
+
+    try {
+      rec.start();
     } catch (err) {
-      console.error(err);
+      console.error("rec.start() failed:", err);
+      activeRef.current = false;
       setStatus("Idle");
     }
-  };
-
- rec.onerror = (e) => {
-  console.log("Speech error:", e.error);
-
-  if (e.error === "no-speech") {
-    console.log("No speech detected — retrying");
-
-    setTimeout(() => {
-      startListeningRef.current?.();
-    }, 2000);
-
-    return;
-  }
-
-  setStatus("Idle");
-};
-
-  rec.onend = () => {
-    console.log("Recognition ended");
-  };
-
-  try {
-    rec.start();
-  } catch (err) {
-    console.error(err);
-    setStatus("Idle");
-  }
-}, [speak]);
+  }, [speak]);
 
   // Keep ref in sync
   useEffect(() => {
@@ -470,32 +469,26 @@ rec.phraseTimeLimit = 8;  // ✅ FIX: more alternatives = better accuracy
       }
       window.speechSynthesis.cancel();
     } else {
-      // FIX: Pre-check mic permission before starting
+      // FIX 7: Pre-check mic permission before starting
+      const tryStart = () => {
+        activeRef.current    = false; // reset so startListening can proceed
+        handsFreeRef.current = true;
+        setHandsFree(true);
+        setMicOk(true);
+        // Don't set status here — startListening will set it to "Listening"
+        setTimeout(() => startListeningRef.current?.(), 300);
+      };
+
       navigator.permissions?.query({ name: "microphone" }).then((result) => {
         if (result.state === "denied") {
           setMicOk(false);
           setToast("Microphone blocked. Allow mic in Chrome settings and refresh.");
           return;
         }
-        activeRef.current    = false;
-        handsFreeRef.current = true;
-        setHandsFree(true);
-        setMicOk(true);
-        setStatus("Listening");
-
-setTimeout(() => {
-  startListeningRef.current?.();
-}, 1200);
+        tryStart();
       }).catch(() => {
-        // permissions API not available, just try anyway
-        activeRef.current    = false;
-        handsFreeRef.current = true;
-        setHandsFree(true);
-        setStatus("Listening");
-
-setTimeout(() => {
-  startListeningRef.current?.();
-}, 1200);
+        // permissions API not supported — attempt anyway
+        tryStart();
       });
     }
   }, []);
@@ -531,10 +524,7 @@ setTimeout(() => {
         <div style={S.canvasWrap}>
           <Canvas
             camera={{ position: [0, 0, 6], fov: 55 }}
-            // FIX: Suppress THREE.Clock deprecation warning
-            onCreated={({ gl }) => {
-              gl.debug = { checkShaderErrors: false };
-            }}
+            onCreated={({ gl }) => { gl.debug = { checkShaderErrors: false }; }}
           >
             <ambientLight intensity={0.4} />
             <pointLight position={[8, 8, 8]}   intensity={4} color="#00d4e8" />
@@ -584,7 +574,6 @@ setTimeout(() => {
               />
               <span style={{ ...S.badgeLabel, color: meta.color }}>{meta.label}</span>
 
-              {/* FIX: "Speak now!" nudge shown inside the badge while listening */}
               <AnimatePresence>
                 {status === "Listening" && (
                   <motion.span
@@ -651,7 +640,7 @@ setTimeout(() => {
             )}
           </AnimatePresence>
 
-          {/* FIX: Toast notification for errors */}
+          {/* Toast notification for errors */}
           <AnimatePresence>
             {toast && (
               <Toast message={toast} onDone={() => setToast("")} />
